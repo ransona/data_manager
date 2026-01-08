@@ -18,6 +18,7 @@ from .scanner import (
     scan_scope,
     update_metrics_for_nodes,
 )
+from .tif_scan import find_tif_candidates
 
 
 def format_size(value: Optional[int]) -> str:
@@ -62,6 +63,7 @@ class DataManagerApp:
         self.action_progress_label = tk.StringVar(value="")
         self.conflict_banner = tk.StringVar(value="")
         self._conflict_choice_cached = None  # (choice, apply_all)
+        self.cross_prompt_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self.refresh_all()
@@ -98,6 +100,9 @@ class DataManagerApp:
             side=tk.LEFT, padx=5
         )
         ttk.Button(top_frame, text="Show all conflicts", command=self.open_all_conflicts).pack(
+            side=tk.LEFT, padx=5
+        )
+        ttk.Button(top_frame, text="Scan for removable tifs", command=self.scan_tif_candidates).pack(
             side=tk.LEFT, padx=5
         )
         if self.current_user == "adamranson":
@@ -142,6 +147,9 @@ class DataManagerApp:
             controls, text="Mark for deletion", command=self.toggle_mark
         )
         self.mark_btn.pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(
+            controls, text="Ask about raw/processed together", variable=self.cross_prompt_var
+        ).pack(side=tk.LEFT, padx=5)
 
         self.owner_value = tk.StringVar()
         ttk.Label(controls, text="Owner override:").pack(side=tk.LEFT, padx=(10, 2))
@@ -161,7 +169,7 @@ class DataManagerApp:
         parent.add(frame, weight=1)
         ttk.Label(frame, text=title, font=("Arial", 11, "bold")).pack(anchor="w")
         columns = ("size", "last", "owner", "marked")
-        tree = ttk.Treeview(frame, columns=columns, show="tree headings", selectmode="browse")
+        tree = ttk.Treeview(frame, columns=columns, show="tree headings", selectmode="extended")
         tree.heading("#0", text="Item")
         tree.heading("size", text="Size")
         tree.heading("last", text="Last access")
@@ -174,11 +182,19 @@ class DataManagerApp:
         tree.column("marked", width=60, anchor="center")
         tree.pack(fill=tk.BOTH, expand=True)
         tree.bind("<<TreeviewSelect>>", self._on_select)
+        tree.bind("<Button-3>", lambda e, t=tree: self._on_right_click(t, e))
         # Derive a strike-through font for marked items
         base_font = tkfont.nametofont("TkDefaultFont").copy()
         base_font.configure(overstrike=True)
         tree.tag_configure("marked_tag", font=base_font)
         return tree
+
+    def _on_right_click(self, tree: ttk.Treeview, event) -> None:
+        # Select the item under cursor and trigger mark toggle across selection
+        item = tree.identify_row(event.y)
+        if item:
+            tree.selection_set(item)
+            self.toggle_mark()
 
     # Actions
     def refresh_all(self) -> None:
@@ -351,21 +367,32 @@ class DataManagerApp:
             text="Unmark deletion" if node.marked_for_deletion else "Mark for deletion"
         )
 
-    def _selected_node(self) -> Optional[DataNode]:
+    def _selected_nodes(self) -> List[DataNode]:
+        keys = []
         for tree in (self.raw_tree, self.proc_tree):
-            sel = tree.selection()
-            if sel:
-                key = sel[0]
-                return self.nodes_by_key.get(key)
-        return None
+            keys.extend(tree.selection())
+        nodes: List[DataNode] = []
+        for k in keys:
+            node = self.nodes_by_key.get(k)
+            if node:
+                nodes.append(node)
+        return nodes
+
+    def _selected_node(self) -> Optional[DataNode]:
+        nodes = self._selected_nodes()
+        return nodes[0] if nodes else None
 
     def toggle_mark(self) -> None:
-        node = self._selected_node()
-        if not node:
+        nodes = self._selected_nodes()
+        if not nodes:
             return
-        # Always operate at expID level; selecting an animal marks/unmarks all its expIDs for that owner
-        targets: List[DataNode] = (
-            [
+        # decide desired state: if any unmarked -> mark, else unmark
+        mark_state = not all(n.marked_for_deletion for n in nodes)
+        self._mark_nodes(nodes, mark_state)
+
+    def _targets_for_node(self, node: DataNode) -> List[DataNode]:
+        if node.exp_id is None:
+            return [
                 n
                 for n in self.nodes_by_key.values()
                 if n.scope == node.scope
@@ -373,18 +400,26 @@ class DataManagerApp:
                 and n.owner == node.owner
                 and n.exp_id is not None
             ]
-            if node.exp_id is None
-            else [node]
-        )
-        if not targets:
+        return [node]
+
+    def _mark_nodes(self, nodes: List[DataNode], mark_state: bool) -> None:
+        # gather targets based on animals -> expIDs
+        target_set = []
+        seen = set()
+        for node in nodes:
+            for t in self._targets_for_node(node):
+                if t.key not in seen:
+                    seen.add(t.key)
+                    target_set.append(t)
+        if not target_set:
             return
 
-        total = len(targets)
+        total = len(target_set)
         self.action_progress.set(0)
         self.action_progress_label.set("Updating…")
         self._conflict_choice_cached = None
-        for idx, n in enumerate(targets, start=1):
-            if node.marked_for_deletion:
+        for idx, n in enumerate(target_set, start=1):
+            if not mark_state:
                 self.datastore.clear_kill_flag(n.scope, n.animal_id, n.exp_id)
                 self.datastore.clear_blocks(n.scope, n.animal_id, n.exp_id)
                 n.marked_for_deletion = False
@@ -392,16 +427,18 @@ class DataManagerApp:
                 actor = self._acting_user()
                 blockers = self._blocking_users(n.animal_id, n.exp_id) if n.scope == "raw" else []
                 choice_to_apply = None
-                apply_all = False
                 if actor in blockers:
                     if self._conflict_choice_cached:
-                        choice_to_apply, apply_all = self._conflict_choice_cached
-                    else:
+                        choice_to_apply, _ = self._conflict_choice_cached
+                    elif self.cross_prompt_var.get():
                         choice_to_apply, apply_all = self._prompt_conflict_choice(n.animal_id, n.exp_id, actor)
                         if apply_all:
                             self._conflict_choice_cached = (choice_to_apply, True)
+                    else:
+                        choice_to_apply = "keep_processed"
                 if choice_to_apply:
                     if choice_to_apply == "cancel":
+                        self.action_progress.set((idx / total) * 100)
                         continue
                     if choice_to_apply == "delete_both":
                         for proc in self.processed_all:
@@ -415,11 +452,12 @@ class DataManagerApp:
                                     proc.scope, proc.animal_id, proc.exp_id, marked_by=actor
                                 )
                                 self.datastore.set_kill_status(proc.scope, proc.animal_id, proc.exp_id, "pending")
-                        # Only remove actor’s block; other users remain
+                                proc.marked_for_deletion = True
+                                self.nodes_by_key[proc.key] = proc
+                                self._refresh_node_in_tree(proc)
                         self.datastore.resolve_block(n.scope, n.animal_id, n.exp_id, actor)
                         blockers = [b for b in blockers if b != actor]
                     elif choice_to_apply == "keep_processed":
-                        # Allow raw deletion while keeping processed; remove only actor from blockers
                         self.datastore.resolve_block(n.scope, n.animal_id, n.exp_id, actor)
                         blockers = [b for b in blockers if b != actor]
 
@@ -694,31 +732,6 @@ class DataManagerApp:
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=5)
 
     def open_delete_list(self) -> None:
-        rows = self.datastore.load_kill_flags().values()
-        overrides = self.datastore.load_overrides()
-        metrics = self.datastore.load_metrics()
-
-        def owner_for_row(row) -> str:
-            key = (row["scope"], row["animal_id"], row["exp_id"])
-            parent_key = (row["scope"], row["animal_id"], None)
-            if key in overrides:
-                return overrides[key]
-            if row["exp_id"] and parent_key in overrides:
-                return overrides[parent_key]
-            if row["scope"] == "raw":
-                return guess_owner(row["animal_id"], row["exp_id"], self.user_map) or "unknown"
-            return "unknown"
-
-        grouped: Dict[str, List[Dict]] = {}
-        total_bytes = 0
-        for row in rows:
-            owner = owner_for_row(row)
-            grouped.setdefault(owner, []).append(row)
-            mkey = (row["scope"], row["animal_id"], row["exp_id"])
-            mrow = metrics.get(mkey)
-            if mrow and mrow["size_bytes"]:
-                total_bytes += mrow["size_bytes"]
-
         if self.kill_window and tk.Toplevel.winfo_exists(self.kill_window):
             self.kill_window.destroy()
 
@@ -726,7 +739,15 @@ class DataManagerApp:
         self.kill_window = win
         win.title("Delete list")
         win.geometry("800x400")
-        ttk.Label(win, text=f"Total size: {format_size(total_bytes)} (cached)").pack(anchor="w", padx=10, pady=(8, 0))
+        controls = ttk.Frame(win)
+        controls.pack(fill=tk.X, padx=10, pady=(8, 4))
+        ttk.Label(controls, text="Show:").pack(side=tk.LEFT)
+        selected_var = tk.StringVar(value=self._acting_user())
+        user_combo = ttk.Combobox(controls, values=["all"] + self.available_users, textvariable=selected_var, width=18)
+        user_combo.pack(side=tk.RIGHT, padx=5)
+
+        total_label = ttk.Label(win, text="Total size: —")
+        total_label.pack(anchor="w", padx=10, pady=(0, 4))
 
         columns = ("scope", "animal", "exp", "status", "note", "marked_at", "marked_by")
         tree = ttk.Treeview(win, columns=columns, show="tree headings")
@@ -750,32 +771,109 @@ class DataManagerApp:
             tree.column(col, width=width, anchor="w")
         tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        if not grouped:
-            tree.insert("", tk.END, text="(empty)", values=("", "", "", "", "", ""))
-        else:
-            for owner, entries in sorted(grouped.items(), key=lambda kv: kv[0]):
-                parent = tree.insert("", tk.END, text=owner, open=True)
-                for row in entries:
-                    exp_display = row["exp_id"] or "(entire animal)"
-                    marked_at = (
-                        time.strftime("%Y-%m-%d %H:%M", time.localtime(row["marked_at"]))
-                        if row["marked_at"]
-                        else ""
-                    )
-                    tree.insert(
-                        parent,
+        ttk.Label(win, text="File-level deletions").pack(anchor="w", padx=10, pady=(4, 0))
+        file_tree = ttk.Treeview(win, columns=("path", "scope", "exp", "marked_by", "age"), show="headings")
+        for col, width in [("path", 420), ("scope", 70), ("exp", 180), ("marked_by", 100), ("age", 60)]:
+            file_tree.heading(col, text=col.title())
+            file_tree.column(col, width=width, anchor="w")
+        file_tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+
+        def owner_for_row(row) -> str:
+            key = (row["scope"], row["animal_id"], row["exp_id"])
+            parent_key = (row["scope"], row["animal_id"], None)
+            overrides = self.datastore.load_overrides()
+            if key in overrides:
+                return overrides[key]
+            if row["exp_id"] and parent_key in overrides:
+                return overrides[parent_key]
+            if row["scope"] == "raw":
+                return guess_owner(row["animal_id"], row["exp_id"], self.user_map) or "unknown"
+            return "unknown"
+
+        def owner_for_file(row) -> str:
+            return guess_owner(row["animal_id"], row["exp_id"], self.user_map) or "unknown"
+
+        def render(filter_user: str) -> None:
+            tree.delete(*tree.get_children())
+            file_tree.delete(*file_tree.get_children())
+            metrics = self.datastore.load_metrics()
+            kill_rows = self.datastore.load_kill_flags().values()
+            file_rows = self.datastore.load_file_deletions().values()
+
+            grouped: Dict[str, List[Dict]] = {}
+            total_bytes = 0
+            for row in kill_rows:
+                owner = owner_for_row(row)
+                if filter_user != "all" and owner != filter_user:
+                    continue
+                grouped.setdefault(owner, []).append(row)
+                mkey = (row["scope"], row["animal_id"], row["exp_id"])
+                mrow = metrics.get(mkey)
+                if mrow and mrow["size_bytes"]:
+                    total_bytes += mrow["size_bytes"]
+
+            if not grouped:
+                tree.insert("", tk.END, text="(empty)", values=("", "", "", "", "", ""))
+            else:
+                for owner, entries in sorted(grouped.items(), key=lambda kv: kv[0]):
+                    parent = tree.insert("", tk.END, text=owner, open=True)
+                    for row in entries:
+                        exp_display = row["exp_id"] or "(entire animal)"
+                        marked_at = (
+                            time.strftime("%Y-%m-%d %H:%M", time.localtime(row["marked_at"]))
+                            if row["marked_at"]
+                            else ""
+                        )
+                        tree.insert(
+                            parent,
+                            tk.END,
+                            text="",
+                            values=(
+                                row["scope"],
+                                row["animal_id"],
+                                exp_display,
+                                row["status"],
+                                row["note"] or "",
+                                marked_at,
+                                row["marked_by"] or "",
+                            ),
+                        )
+
+            if not file_rows:
+                file_tree.insert("", tk.END, values=("none", "", "", "", ""))
+            else:
+                for row in file_rows:
+                    owner = owner_for_file(row)
+                    if filter_user != "all" and owner != filter_user:
+                        continue
+                    age = ""
+                    if row["marked_at"]:
+                        age = f"{(time.time() - row['marked_at'])/86400:.1f} d"
+                    file_tree.insert(
+                        "",
                         tk.END,
-                        text="",
                         values=(
+                            row["path"],
                             row["scope"],
-                            row["animal_id"],
-                            exp_display,
-                            row["status"],
-                            row["note"] or "",
-                            marked_at,
-                            row["marked_by"] or "",
+                            f"{row['animal_id']}/{row['exp_id'] or ''}",
+                            row["marked_by"],
+                            age,
                         ),
                     )
+
+            total_label.config(text=f"Total size: {format_size(total_bytes)} (cached)")
+
+        def set_filter(user: str) -> None:
+            selected_var.set(user)
+            render(user)
+
+        ttk.Button(controls, text="Current user", command=lambda: set_filter(self._acting_user())).pack(
+            side=tk.LEFT, padx=4
+        )
+        ttk.Button(controls, text="All users", command=lambda: set_filter("all")).pack(side=tk.LEFT, padx=4)
+        ttk.Button(controls, text="Show user", command=lambda: set_filter(selected_var.get())).pack(side=tk.LEFT, padx=4)
+
+        render(self._acting_user())
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 10))
 
     def open_conflicts(self) -> None:
@@ -1029,6 +1127,7 @@ class DataManagerApp:
             with self.datastore._connect() as conn:  # reuse connection helper
                 conn.execute("DELETE FROM kill_list")
                 conn.execute("DELETE FROM deletion_blocks")
+                conn.execute("DELETE FROM file_deletions")
                 conn.commit()
             messagebox.showinfo("Cleared", "Kill list and deletion blocks cleared.")
             self.refresh_all()
@@ -1037,6 +1136,77 @@ class DataManagerApp:
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=5)
 
         ttk.Button(win, text="Show per-user usage", command=self.show_usage_panel).pack(pady=5)
+
+    def scan_tif_candidates(self) -> None:
+        selected_user = self.selected_user.get()
+        show_all = selected_user == "all"
+        processed_nodes = scan_scope(
+            "processed",
+            selected_user,
+            self.paths,
+            self.datastore,
+            self.user_map,
+            available_users=self.available_users,
+        )
+        if not show_all:
+            processed_nodes = [n for n in processed_nodes if (n.owner or "") == selected_user]
+
+        candidates = find_tif_candidates(processed_nodes, self.paths)
+
+        win = tk.Toplevel(self.root)
+        win.title("Removable tifs")
+        win.geometry("700x400")
+        columns = ("animal", "exp", "tifs", "raw_path")
+        tree = ttk.Treeview(win, columns=columns, show="headings", selectmode="extended")
+        for col, width in [("animal", 120), ("exp", 200), ("tifs", 80), ("raw_path", 260)]:
+            tree.heading(col, text=col.title())
+            tree.column(col, width=width, anchor="w")
+        tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        strike_font = tkfont.nametofont("TkDefaultFont").copy()
+        strike_font.configure(overstrike=True)
+        tree.tag_configure("marked_tag", font=strike_font)
+
+        existing_files = self.datastore.load_file_deletions().values()
+        marked_exps = {(row["animal_id"], row["exp_id"]) for row in existing_files}
+        for animal, exp, raw_path, tif_count in candidates:
+            tags = ("marked_tag",) if (animal, exp) in marked_exps else ()
+            tree.insert("", tk.END, iid=f"{animal}|{exp}", values=(animal, exp, tif_count, str(raw_path)), tags=tags)
+
+        def apply_mark(iids, mark_state: bool):
+            actor = self._acting_user()
+            for key in iids:
+                animal, exp = key.split("|")
+                raw_path = self.paths.raw_root / animal / exp
+                if mark_state:
+                    from .tif_scan import list_tif_files
+
+                    for tif_path in list_tif_files(raw_path):
+                        self.datastore.set_file_deletion(
+                            str(tif_path), "raw", animal, exp, marked_by=actor, status="pending"
+                        )
+                    tree.item(key, tags=("marked_tag",))
+                else:
+                    self.datastore.clear_file_deletions_for_exp("raw", animal, exp)
+                    tree.item(key, tags=tuple(t for t in tree.item(key, "tags") if t != "marked_tag"))
+
+        def mark_selected():
+            sel = tree.selection()
+            if not sel:
+                return
+            mark_state = not all("marked_tag" in tree.item(key, "tags") for key in sel)
+            apply_mark(sel, mark_state)
+
+        def on_right_click(event):
+            iid = tree.identify_row(event.y)
+            if iid:
+                tree.selection_set(iid)
+                mark_state = not ("marked_tag" in tree.item(iid, "tags"))
+                apply_mark([iid], mark_state)
+                self.refresh_all()
+        tree.bind("<Button-3>", on_right_click)
+
+        ttk.Button(win, text="Mark selected for deletion", command=mark_selected).pack(pady=5)
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=5)
     def _on_close(self) -> None:
         self._stop_metric_scan()
         self.root.destroy()
