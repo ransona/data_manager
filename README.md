@@ -1,6 +1,6 @@
-# Data Manager GUI (prototype)
+# Data Manager GUI
 
-A lightweight Tkinter-based GUI for reviewing raw and processed data, assigning ownership, and marking items for deletion. The app reads existing directory structures and stores state in a shared SQLite DB so multiple users can collaborate.
+A GUI for reviewing raw and processed data, assigning ownership, and marking items for deletion. The app reads existing directory structures and stores state in a shared SQLite DB so multiple users can concurrently edit.
 
 ## Paths and config
 - Raw data root: `/data/Remote_Repository`
