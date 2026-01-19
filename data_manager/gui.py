@@ -893,13 +893,21 @@ class DataManagerApp:
             if row["exp_id"] and parent_key in overrides:
                 return overrides[parent_key]
             if row["scope"] == "raw":
-                return guess_owner(row["animal_id"], row["exp_id"], self.user_map) or "unknown"
+                exp_owner = guess_owner(row["animal_id"], row["exp_id"], self.user_map)
+                if exp_owner:
+                    return exp_owner
+                animal_owner = guess_owner(row["animal_id"], None, self.user_map)
+                return animal_owner or "unknown"
             return "unknown"
 
         def owner_for_file(row) -> str:
             if row["scope"] == "processed":
                 return row["marked_by"] or "unknown"
-            return guess_owner(row["animal_id"], row["exp_id"], self.user_map) or "unknown"
+            exp_owner = guess_owner(row["animal_id"], row["exp_id"], self.user_map)
+            if exp_owner:
+                return exp_owner
+            animal_owner = guess_owner(row["animal_id"], None, self.user_map)
+            return animal_owner or "unknown"
 
         def render(filter_user: str) -> None:
             tree.delete(*tree.get_children())
