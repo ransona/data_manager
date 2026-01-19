@@ -10,6 +10,23 @@ from .database import DataStore, ScopeKey
 from .models import DataNode
 
 
+def load_exclude_dirs(paths: DataPaths) -> List[str]:
+    exclude_file = Path("exclude_dirs.txt")
+    if not exclude_file.exists():
+        return []
+    entries: List[str] = []
+    try:
+        with exclude_file.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                name = line.strip()
+                if not name or name.startswith("#"):
+                    continue
+                entries.append(name.lower())
+    except OSError:
+        return []
+    return entries
+
+
 def detect_current_user() -> str:
     return getpass.getuser()
 
@@ -132,6 +149,7 @@ def scan_scope(
     metrics_lookup = datastore.load_metrics()
     overrides = datastore.load_overrides()
     kill_lookup = datastore.load_kill_flags()
+    excluded = set(load_exclude_dirs(paths))
 
     nodes: List[DataNode] = []
 
@@ -161,6 +179,8 @@ def scan_scope(
 
         for animal_entry in animal_entries:
             animal_id = animal_entry.name
+            if excluded and animal_id.lower() in excluded:
+                continue
             owner, has_override = _resolve_owner(
                 scope, animal_id, None, user_map, overrides, default_user=default_owner
             )

@@ -65,6 +65,9 @@ class DataManagerApp:
         self._conflict_choice_cached = None  # (choice, apply_all)
         self.cross_prompt_var = tk.BooleanVar(value=False)
         self.active_tree: Optional[ttk.Treeview] = None
+        self.show_unknown_var = tk.BooleanVar(value=False)
+        self.progress_window: Optional[tk.Toplevel] = None
+        self.show_only_marked_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self.refresh_all()
@@ -112,11 +115,7 @@ class DataManagerApp:
         self.status_var = tk.StringVar(value="")
         ttk.Label(top_frame, textvariable=self.status_var).pack(side=tk.LEFT, padx=10)
         ttk.Label(top_frame, textvariable=self.usage_var).pack(side=tk.LEFT, padx=10)
-        self.progress_bar = ttk.Progressbar(
-            top_frame, variable=self.action_progress, length=180, mode="determinate"
-        )
-        self.progress_bar.pack(side=tk.RIGHT, padx=5)
-        ttk.Label(top_frame, textvariable=self.action_progress_label).pack(side=tk.RIGHT, padx=5)
+        # Progress is shown in a modal popup when needed.
         ttk.Button(top_frame, text="Conflicts", command=self.open_conflicts).pack(side=tk.RIGHT, padx=5)
         ttk.Button(top_frame, text="Show usage", command=self.show_usage_panel).pack(side=tk.RIGHT, padx=5)
 
@@ -150,6 +149,18 @@ class DataManagerApp:
         self.mark_btn.pack(side=tk.LEFT, padx=5)
         ttk.Checkbutton(
             controls, text="Ask about raw/processed together", variable=self.cross_prompt_var
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(
+            controls,
+            text="Show unknown owners (raw)",
+            variable=self.show_unknown_var,
+            command=self.refresh_all,
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(
+            controls,
+            text="Show only marked for deletion",
+            variable=self.show_only_marked_var,
+            command=self.refresh_all,
         ).pack(side=tk.LEFT, padx=5)
 
         self.owner_value = tk.StringVar()
@@ -236,19 +247,58 @@ class DataManagerApp:
                 filtered: List[DataNode] = []
                 for items in grouped.values():
                     animal_node = next((i for i in items if i.exp_id is None), None)
-                    matching_exps = [i for i in items if i.exp_id and (i.owner or "") == selected_user]
+                    matching_exps = [
+                        i
+                        for i in items
+                        if i.exp_id
+                        and ((i.owner or "") == selected_user or (self.show_unknown_var.get() and not i.owner))
+                    ]
                     if matching_exps:
                         if animal_node:
                             filtered.append(animal_node)
                         filtered.extend(matching_exps)
-                    elif animal_node and (animal_node.owner or "") == selected_user:
+                    elif animal_node and (
+                        (animal_node.owner or "") == selected_user
+                        or (self.show_unknown_var.get() and not animal_node.owner)
+                    ):
                         filtered.append(animal_node)
+                if self.show_only_marked_var.get():
+                    marked = []
+                    grouped_filtered: Dict[str, List[DataNode]] = {}
+                    for n in filtered:
+                        grouped_filtered.setdefault(n.animal_id, []).append(n)
+                    for items in grouped_filtered.values():
+                        animal_node = next((i for i in items if i.exp_id is None), None)
+                        marked_exps = [i for i in items if i.exp_id and i.marked_for_deletion]
+                        if marked_exps:
+                            if animal_node:
+                                marked.append(animal_node)
+                            marked.extend(marked_exps)
+                    return marked
                 return filtered
 
             raw_nodes = filter_nodes(raw_nodes)
             processed_nodes = filter_nodes(processed_nodes)
 
         self.nodes_by_key = {node.key: node for node in [*raw_nodes, *processed_nodes]}
+
+        def marked_only(nodes: List[DataNode]) -> List[DataNode]:
+            grouped: Dict[str, List[DataNode]] = {}
+            for n in nodes:
+                grouped.setdefault(n.animal_id, []).append(n)
+            marked = []
+            for items in grouped.values():
+                animal_node = next((i for i in items if i.exp_id is None), None)
+                marked_exps = [i for i in items if i.exp_id and i.marked_for_deletion]
+                if marked_exps:
+                    if animal_node:
+                        marked.append(animal_node)
+                    marked.extend(marked_exps)
+            return marked
+
+        if show_all and self.show_only_marked_var.get():
+            raw_nodes = marked_only(raw_nodes)
+            processed_nodes = marked_only(processed_nodes)
 
         self._populate_tree(self.raw_tree, raw_nodes, scope="raw", show_all=show_all)
         self._populate_tree(self.proc_tree, processed_nodes, scope="processed", show_all=show_all)
@@ -394,7 +444,14 @@ class DataManagerApp:
         nodes = self._selected_nodes(active_only=True)
         if not nodes:
             return
-        # decide desired state: if any unmarked -> mark, else unmark
+        # If a single animal is selected, use visible child expIDs to decide toggle
+        if len(nodes) == 1 and nodes[0].exp_id is None:
+            exp_targets = self._visible_exp_targets_for_animal(nodes[0])
+            if exp_targets:
+                mark_state = not all(n.marked_for_deletion for n in exp_targets)
+                self._mark_nodes(exp_targets, mark_state)
+                return
+        # otherwise: if any unmarked -> mark, else unmark
         mark_state = not all(n.marked_for_deletion for n in nodes)
         self._mark_nodes(nodes, mark_state)
 
@@ -410,6 +467,19 @@ class DataManagerApp:
             ]
         return [node]
 
+    def _visible_exp_targets_for_animal(self, node: DataNode) -> List[DataNode]:
+        if node.exp_id is not None:
+            return [node]
+        tree = self.raw_tree if node.scope == "raw" else self.proc_tree
+        if not tree.exists(node.key):
+            return []
+        exp_targets = []
+        for child in tree.get_children(node.key):
+            child_node = self.nodes_by_key.get(child)
+            if child_node and child_node.exp_id is not None:
+                exp_targets.append(child_node)
+        return exp_targets
+
     def _mark_nodes(self, nodes: List[DataNode], mark_state: bool) -> None:
         # gather targets based on animals -> expIDs
         target_set = []
@@ -424,7 +494,7 @@ class DataManagerApp:
 
         total = len(target_set)
         self.action_progress.set(0)
-        self.action_progress_label.set("Updating…")
+        self._show_progress_modal("Updating…")
         self._conflict_choice_cached = None
         for idx, n in enumerate(target_set, start=1):
             if not mark_state:
@@ -487,7 +557,7 @@ class DataManagerApp:
             self._refresh_node_in_tree(n)
             self.action_progress.set((idx / total) * 100)
             self.root.update_idletasks()
-        self.action_progress_label.set("")
+        self._hide_progress_modal()
         self._on_select()
         self._update_conflict_banner(self.selected_user.get())
 
@@ -586,6 +656,27 @@ class DataManagerApp:
         if self.metric_thread and self.metric_thread.is_alive():
             self.metric_stop.set()
         self.metric_thread = None
+
+    def _show_progress_modal(self, message: str) -> None:
+        if self.progress_window and tk.Toplevel.winfo_exists(self.progress_window):
+            self.action_progress_label.set(message)
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Updating")
+        win.geometry("300x120")
+        win.transient(self.root)
+        win.grab_set()
+        self.progress_window = win
+        self.action_progress_label.set(message)
+        ttk.Label(win, textvariable=self.action_progress_label).pack(pady=10)
+        bar = ttk.Progressbar(win, variable=self.action_progress, length=240, mode="determinate")
+        bar.pack(pady=5)
+
+    def _hide_progress_modal(self) -> None:
+        if self.progress_window and tk.Toplevel.winfo_exists(self.progress_window):
+            self.progress_window.grab_release()
+            self.progress_window.destroy()
+        self.progress_window = None
 
     def _prompt_conflict_choice(self, animal_id: str, exp_id: str, actor: str) -> tuple:
         """
@@ -749,13 +840,18 @@ class DataManagerApp:
         win.geometry("800x400")
         controls = ttk.Frame(win)
         controls.pack(fill=tk.X, padx=10, pady=(8, 4))
-        ttk.Label(controls, text="Show:").pack(side=tk.LEFT)
+        ttk.Label(controls, text="Show:").pack(side=tk.LEFT, padx=(0, 6))
         selected_var = tk.StringVar(value=self._acting_user())
         user_combo = ttk.Combobox(controls, values=["all"] + self.available_users, textvariable=selected_var, width=18)
-        user_combo.pack(side=tk.RIGHT, padx=5)
+        user_combo.pack(side=tk.LEFT, padx=4)
+        user_combo.bind("<<ComboboxSelected>>", lambda _e: render(selected_var.get()))
 
-        total_label = ttk.Label(win, text="Total size: —")
+        total_label = ttk.Label(win, text="Total size (current view): —")
         total_label.pack(anchor="w", padx=10, pady=(0, 4))
+        hide_deleted_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            controls, text="Hide deleted", variable=hide_deleted_var, command=lambda: render(selected_var.get())
+        ).pack(side=tk.LEFT, padx=6)
 
         columns = ("scope", "animal", "exp", "status", "note", "marked_at", "marked_by")
         tree = ttk.Treeview(win, columns=columns, show="tree headings")
@@ -789,6 +885,8 @@ class DataManagerApp:
         def owner_for_row(row) -> str:
             key = (row["scope"], row["animal_id"], row["exp_id"])
             parent_key = (row["scope"], row["animal_id"], None)
+            if row["scope"] == "processed":
+                return row["marked_by"] or "unknown"
             overrides = self.datastore.load_overrides()
             if key in overrides:
                 return overrides[key]
@@ -799,6 +897,8 @@ class DataManagerApp:
             return "unknown"
 
         def owner_for_file(row) -> str:
+            if row["scope"] == "processed":
+                return row["marked_by"] or "unknown"
             return guess_owner(row["animal_id"], row["exp_id"], self.user_map) or "unknown"
 
         def render(filter_user: str) -> None:
@@ -811,9 +911,11 @@ class DataManagerApp:
             grouped: Dict[str, List[Dict]] = {}
             total_bytes = 0
             for row in kill_rows:
-                owner = owner_for_row(row)
-                if filter_user != "all" and owner != filter_user:
+                if hide_deleted_var.get() and row["status"] == "deleted":
                     continue
+                if filter_user != "all" and row["marked_by"] != filter_user:
+                    continue
+                owner = owner_for_row(row)
                 grouped.setdefault(owner, []).append(row)
                 mkey = (row["scope"], row["animal_id"], row["exp_id"])
                 mrow = metrics.get(mkey)
@@ -851,12 +953,18 @@ class DataManagerApp:
                 file_tree.insert("", tk.END, values=("none", "", "", "", ""))
             else:
                 for row in file_rows:
-                    owner = owner_for_file(row)
-                    if filter_user != "all" and owner != filter_user:
+                    if hide_deleted_var.get() and row["status"] == "deleted":
                         continue
+                    if filter_user != "all" and row["marked_by"] != filter_user:
+                        continue
+                    owner = owner_for_file(row)
                     age = ""
                     if row["marked_at"]:
                         age = f"{(time.time() - row['marked_at'])/86400:.1f} d"
+                    try:
+                        total_bytes += Path(row["path"]).stat().st_size
+                    except OSError:
+                        pass
                     file_tree.insert(
                         "",
                         tk.END,
@@ -869,7 +977,8 @@ class DataManagerApp:
                         ),
                     )
 
-            total_label.config(text=f"Total size: {format_size(total_bytes)} (cached)")
+            total_gb = total_bytes / (1024 ** 3) if total_bytes else 0
+            total_label.config(text=f"Total size (current view): {total_gb:.2f} GB")
 
         def set_filter(user: str) -> None:
             selected_var.set(user)
