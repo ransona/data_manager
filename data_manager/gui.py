@@ -64,6 +64,7 @@ class DataManagerApp:
         self.conflict_banner = tk.StringVar(value="")
         self._conflict_choice_cached = None  # (choice, apply_all)
         self.cross_prompt_var = tk.BooleanVar(value=False)
+        self.active_tree: Optional[ttk.Treeview] = None
 
         self._build_ui()
         self.refresh_all()
@@ -193,6 +194,7 @@ class DataManagerApp:
         # Select the item under cursor and trigger mark toggle across selection
         item = tree.identify_row(event.y)
         if item:
+            self.active_tree = tree
             tree.selection_set(item)
             self.toggle_mark()
 
@@ -348,7 +350,9 @@ class DataManagerApp:
             return sel
         return self.current_user
 
-    def _on_select(self, _event=None) -> None:
+    def _on_select(self, event=None) -> None:
+        if event is not None:
+            self.active_tree = event.widget
         node = self._selected_node()
         if not node:
             self.detail_label.config(text="Select an animal or experiment…")
@@ -367,10 +371,12 @@ class DataManagerApp:
             text="Unmark deletion" if node.marked_for_deletion else "Mark for deletion"
         )
 
-    def _selected_nodes(self) -> List[DataNode]:
+    def _selected_nodes(self, active_only: bool = False) -> List[DataNode]:
         keys = []
-        for tree in (self.raw_tree, self.proc_tree):
-            keys.extend(tree.selection())
+        trees = [self.active_tree] if active_only and self.active_tree else [self.raw_tree, self.proc_tree]
+        for tree in trees:
+            if tree:
+                keys.extend(tree.selection())
         nodes: List[DataNode] = []
         for k in keys:
             node = self.nodes_by_key.get(k)
@@ -379,11 +385,13 @@ class DataManagerApp:
         return nodes
 
     def _selected_node(self) -> Optional[DataNode]:
-        nodes = self._selected_nodes()
+        nodes = self._selected_nodes(active_only=True)
+        if not nodes:
+            nodes = self._selected_nodes()
         return nodes[0] if nodes else None
 
     def toggle_mark(self) -> None:
-        nodes = self._selected_nodes()
+        nodes = self._selected_nodes(active_only=True)
         if not nodes:
             return
         # decide desired state: if any unmarked -> mark, else unmark
