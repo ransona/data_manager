@@ -113,6 +113,9 @@ class DataManagerApp:
         ttk.Button(top_frame, text="Scan for removable tifs", command=self.scan_tif_candidates).pack(
             side=tk.LEFT, padx=5
         )
+        ttk.Button(top_frame, text="Show orphans", command=self.show_orphans).pack(
+            side=tk.LEFT, padx=5
+        )
         if self.current_user == "adamranson":
             ttk.Button(top_frame, text="Admin", command=self.open_admin).pack(side=tk.LEFT, padx=5)
 
@@ -217,14 +220,29 @@ class DataManagerApp:
             nodes = self._selected_nodes(active_only=True)
             if not nodes:
                 return
-            tagged = sum(1 for n in nodes if n.marked_for_deletion)
+            targets = []
+            seen = set()
+            for node in nodes:
+                if node.exp_id is None:
+                    exp_targets = self._visible_exp_targets_for_animal(node)
+                    for t in exp_targets:
+                        if t.key not in seen:
+                            seen.add(t.key)
+                            targets.append(t)
+                else:
+                    if node.key not in seen:
+                        seen.add(node.key)
+                        targets.append(node)
+            if not targets:
+                return
+            tagged = sum(1 for n in targets if n.marked_for_deletion)
             if tagged == 0:
                 mark_state = True
-            elif tagged == len(nodes):
+            elif tagged == len(targets):
                 mark_state = False
             else:
-                mark_state = False if tagged / len(nodes) > 0.5 else True
-            self._mark_nodes(nodes, mark_state)
+                mark_state = False if tagged / len(targets) >= 0.5 else True
+            self._mark_nodes(targets, mark_state)
 
     # Actions
     def refresh_all(self) -> None:
@@ -591,6 +609,18 @@ class DataManagerApp:
             self.datastore.set_override(node.scope, node.animal_id, node.exp_id, owner)
             node.owner = owner
             node.has_override = True
+            if node.exp_id is None:
+                # Propagate owner override to all expIDs under this animal
+                for child in self.nodes_by_key.values():
+                    if (
+                        child.scope == node.scope
+                        and child.animal_id == node.animal_id
+                        and child.exp_id is not None
+                    ):
+                        self.datastore.set_override(child.scope, child.animal_id, child.exp_id, owner)
+                        child.owner = owner
+                        child.has_override = True
+                        self._refresh_node_in_tree(child)
         self._refresh_node_in_tree(node)
         self._on_select()
 
@@ -601,6 +631,17 @@ class DataManagerApp:
         self.datastore.set_override(node.scope, node.animal_id, node.exp_id, owner=None)
         node.has_override = False
         node.owner = None
+        if node.exp_id is None:
+            for child in self.nodes_by_key.values():
+                if (
+                    child.scope == node.scope
+                    and child.animal_id == node.animal_id
+                    and child.exp_id is not None
+                ):
+                    self.datastore.set_override(child.scope, child.animal_id, child.exp_id, owner=None)
+                    child.has_override = False
+                    child.owner = None
+                    self._refresh_node_in_tree(child)
         self._refresh_node_in_tree(node)
         self._on_select()
 
@@ -610,7 +651,13 @@ class DataManagerApp:
             return
         tree.set(node.key, "size", format_size(node.size_bytes))
         tree.set(node.key, "last", format_time(node.last_access_ts))
-        tree.set(node.key, "owner", node.owner or "")
+        owner_value = node.owner or ""
+        if not owner_value and node.exp_id is not None:
+            parent_key = f"{node.scope}|{node.user or ''}|{node.animal_id}|"
+            parent = self.nodes_by_key.get(parent_key)
+            if parent and parent.owner:
+                owner_value = parent.owner
+        tree.set(node.key, "owner", owner_value)
         tree.set(node.key, "marked", "yes" if node.marked_for_deletion else "")
         # Update color
         tree.tag_configure(node.key, background="")
@@ -686,6 +733,8 @@ class DataManagerApp:
         win.title("Updating")
         win.geometry("300x120")
         win.transient(self.root)
+        win.lift()
+        win.attributes("-topmost", True)
         self.progress_window = win
         self.action_progress_label.set(message)
         ttk.Label(win, textvariable=self.action_progress_label).pack(pady=10)
@@ -699,12 +748,17 @@ class DataManagerApp:
         except tk.TclError:
             # If the window isn't viewable yet, skip grab to avoid crash
             pass
+        win.attributes("-topmost", False)
 
     def _hide_progress_modal(self) -> None:
         if self.progress_window and tk.Toplevel.winfo_exists(self.progress_window):
             self.progress_window.grab_release()
             self.progress_window.destroy()
         self.progress_window = None
+        # restore focus to any open child window
+        for child in self.root.winfo_children():
+            if isinstance(child, tk.Toplevel) and child.winfo_exists():
+                child.lift()
 
     def _log_action(self, message: str) -> None:
         username = getpass.getuser()
@@ -1373,6 +1427,208 @@ class DataManagerApp:
         tree.bind("<Button-3>", on_right_click)
 
         ttk.Button(win, text="Mark selected for deletion", command=mark_selected).pack(pady=5)
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=5)
+
+    def show_orphans(self) -> None:
+        selected_user = self.selected_user.get()
+        show_all = selected_user == "all"
+        processed_nodes = scan_scope(
+            "processed",
+            selected_user,
+            self.paths,
+            self.datastore,
+            self.user_map,
+            available_users=self.available_users,
+        )
+        if not show_all:
+            processed_nodes = [n for n in processed_nodes if (n.owner or "") == selected_user]
+
+        raw_nodes = scan_scope(
+            "raw",
+            selected_user,
+            self.paths,
+            self.datastore,
+            self.user_map,
+            available_users=self.available_users,
+        )
+        # exclude raw items already marked for deletion
+        kill_flags = self.datastore.load_kill_flags()
+        raw_keep = [
+            n
+            for n in raw_nodes
+            if not (n.exp_id and (n.scope, n.animal_id, n.exp_id) in kill_flags)
+        ]
+
+        raw_exp_set = {(n.animal_id, n.exp_id) for n in raw_keep if n.exp_id}
+        raw_animals_set = {animal for animal, _exp in raw_exp_set}
+
+        orphan_animals = []
+        orphan_exps = []
+        for n in processed_nodes:
+            if n.exp_id is None:
+                continue
+            if (n.animal_id, n.exp_id) not in raw_exp_set:
+                orphan_exps.append(n)
+        for n in processed_nodes:
+            if n.exp_id is None and n.animal_id not in raw_animals_set:
+                orphan_animals.append(n)
+
+        win = tk.Toplevel(self.root)
+        win.title("Orphans")
+        win.geometry("900x500")
+        panes = ttk.PanedWindow(win, orient=tk.HORIZONTAL)
+        panes.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        left = ttk.Frame(panes)
+        right = ttk.Frame(panes)
+        panes.add(left, weight=1)
+        panes.add(right, weight=2)
+
+        ttk.Label(left, text="Orphan animals", font=("Arial", 11, "bold")).pack(anchor="w")
+        animal_tree = ttk.Treeview(left, columns=("user", "animal", "path"), show="headings", selectmode="extended")
+        animal_tree.heading("user", text="User")
+        animal_tree.heading("animal", text="Animal")
+        animal_tree.heading("path", text="Path")
+        for col, width in [("user", 120), ("animal", 120), ("path", 260)]:
+            animal_tree.column(col, width=width, anchor="w")
+        animal_tree.pack(fill=tk.BOTH, expand=True)
+        strike_font = tkfont.nametofont("TkDefaultFont").copy()
+        strike_font.configure(overstrike=True)
+        animal_tree.tag_configure("marked_tag", font=strike_font)
+
+        ttk.Label(right, text="Orphan expIDs", font=("Arial", 11, "bold")).pack(anchor="w")
+        exp_tree = ttk.Treeview(right, columns=("user", "exp", "path"), show="tree headings", selectmode="extended")
+        exp_tree.heading("#0", text="Animal")
+        exp_tree.heading("user", text="User")
+        exp_tree.heading("exp", text="ExpID")
+        exp_tree.heading("path", text="Path")
+        exp_tree.column("#0", width=140)
+        exp_tree.column("user", width=120, anchor="w")
+        exp_tree.column("exp", width=200, anchor="w")
+        exp_tree.column("path", width=260, anchor="w")
+        exp_tree.pack(fill=tk.BOTH, expand=True)
+        exp_tree.tag_configure("marked_tag", font=strike_font)
+
+        # fill animals
+        for n in orphan_animals:
+            tags = ("marked_tag",) if n.marked_for_deletion else ()
+            animal_tree.insert(
+                "",
+                tk.END,
+                iid=n.key,
+                values=(n.user or "", n.animal_id, str(n.path)),
+                tags=tags,
+            )
+
+        # fill exp tree grouped by animal (and user when showing all)
+        exp_groups: Dict[tuple, List[DataNode]] = {}
+        for n in orphan_exps:
+            key = (n.user if show_all else None, n.animal_id)
+            exp_groups.setdefault(key, []).append(n)
+        for (user, animal), items in sorted(exp_groups.items(), key=lambda kv: kv[0][1]):
+            label = f"{user}/{animal}" if show_all and user else animal
+            parent = exp_tree.insert("", tk.END, text=label, values=("", "", ""), open=True)
+            for n in sorted(items, key=lambda x: x.exp_id or ""):
+                tags = ("marked_tag",) if n.marked_for_deletion else ()
+                exp_tree.insert(
+                    parent,
+                    tk.END,
+                    iid=n.key,
+                    text="",
+                    values=(n.user or "", n.exp_id, str(n.path)),
+                    tags=tags,
+                )
+
+        def selection_nodes(tree: ttk.Treeview) -> List[DataNode]:
+            nodes: List[DataNode] = []
+            for iid in tree.selection():
+                node = self.nodes_by_key.get(iid)
+                if node:
+                    nodes.append(node)
+                else:
+                    # Parent row in exp tree: include its children
+                    for child in tree.get_children(iid):
+                        child_node = self.nodes_by_key.get(child)
+                        if child_node:
+                            nodes.append(child_node)
+            return nodes
+
+        def expand_targets(tree: ttk.Treeview, nodes: List[DataNode]) -> List[DataNode]:
+            targets = []
+            seen = set()
+            for node in nodes:
+                if node.exp_id is None:
+                    # collect all expIDs under this animal from processed nodes
+                    for child in self.nodes_by_key.values():
+                        if (
+                            child.scope == "processed"
+                            and child.animal_id == node.animal_id
+                            and child.exp_id is not None
+                            and (show_all or child.owner == selected_user)
+                        ):
+                            if child.key not in seen:
+                                seen.add(child.key)
+                                targets.append(child)
+                else:
+                    if node.key not in seen:
+                        seen.add(node.key)
+                        targets.append(node)
+            return targets
+
+        def toggle_selected(tree: ttk.Treeview):
+            nodes = selection_nodes(tree)
+            if not nodes:
+                return
+            targets = expand_targets(tree, nodes)
+            if not targets:
+                return
+            tagged = sum(1 for n in targets if n.marked_for_deletion)
+            if tagged == 0:
+                mark_state = True
+            elif tagged == len(targets):
+                mark_state = False
+            else:
+                mark_state = False if tagged / len(targets) >= 0.5 else True
+            self._mark_nodes(targets, mark_state)
+            for n in targets:
+                if tree.exists(n.key):
+                    tags = list(tree.item(n.key, "tags"))
+                    if n.marked_for_deletion and "marked_tag" not in tags:
+                        tags.append("marked_tag")
+                    elif not n.marked_for_deletion and "marked_tag" in tags:
+                        tags.remove("marked_tag")
+                    tree.item(n.key, tags=tuple(tags))
+            # Update animal rows too
+            for node in nodes:
+                if node.exp_id is None and tree.exists(node.key):
+                    tags = list(tree.item(node.key, "tags"))
+                    if mark_state and "marked_tag" not in tags:
+                        tags.append("marked_tag")
+                    elif not mark_state and "marked_tag" in tags:
+                        tags.remove("marked_tag")
+                    tree.item(node.key, tags=tuple(tags))
+            # Refresh exp tree tags when animal orphans are toggled
+            if tree is animal_tree:
+                for child in exp_tree.get_children(""):
+                    for exp_iid in exp_tree.get_children(child):
+                        exp_node = self.nodes_by_key.get(exp_iid)
+                        if exp_node:
+                            tags = list(exp_tree.item(exp_iid, "tags"))
+                            if exp_node.marked_for_deletion and "marked_tag" not in tags:
+                                tags.append("marked_tag")
+                            elif not exp_node.marked_for_deletion and "marked_tag" in tags:
+                                tags.remove("marked_tag")
+                            exp_tree.item(exp_iid, tags=tuple(tags))
+
+        animal_tree.bind(
+            "<Button-3>",
+            lambda e: (animal_tree.selection_set(animal_tree.identify_row(e.y)), toggle_selected(animal_tree)),
+        )
+        exp_tree.bind(
+            "<Button-3>",
+            lambda e: (exp_tree.selection_set(exp_tree.identify_row(e.y)), toggle_selected(exp_tree)),
+        )
+
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=5)
     def _on_close(self) -> None:
         self._stop_metric_scan()
