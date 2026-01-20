@@ -5,7 +5,11 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import os
+import getpass
+from datetime import datetime
 from tkinter import ttk, messagebox
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 from .config import DataPaths, load_user_map
@@ -206,8 +210,21 @@ class DataManagerApp:
         item = tree.identify_row(event.y)
         if item:
             self.active_tree = tree
-            tree.selection_set(item)
-            self.toggle_mark()
+            current = set(tree.selection())
+            if item not in current:
+                tree.selection_set(item)
+                current = {item}
+            nodes = self._selected_nodes(active_only=True)
+            if not nodes:
+                return
+            tagged = sum(1 for n in nodes if n.marked_for_deletion)
+            if tagged == 0:
+                mark_state = True
+            elif tagged == len(nodes):
+                mark_state = False
+            else:
+                mark_state = False if tagged / len(nodes) > 0.5 else True
+            self._mark_nodes(nodes, mark_state)
 
     # Actions
     def refresh_all(self) -> None:
@@ -494,13 +511,15 @@ class DataManagerApp:
 
         total = len(target_set)
         self.action_progress.set(0)
-        self._show_progress_modal("Updating…")
+        if total > 10:
+            self._show_progress_modal("Updating…")
         self._conflict_choice_cached = None
         for idx, n in enumerate(target_set, start=1):
             if not mark_state:
                 self.datastore.clear_kill_flag(n.scope, n.animal_id, n.exp_id)
                 self.datastore.clear_blocks(n.scope, n.animal_id, n.exp_id)
                 n.marked_for_deletion = False
+                self._log_action(f"UNMARK {n.scope} {n.animal_id}/{n.exp_id or ''}")
             else:
                 actor = self._acting_user()
                 blockers = self._blocking_users(n.animal_id, n.exp_id) if n.scope == "raw" else []
@@ -554,10 +573,12 @@ class DataManagerApp:
                         status="pending",
                     )
                 n.marked_for_deletion = True
+                self._log_action(f"MARK {n.scope} {n.animal_id}/{n.exp_id or ''}")
             self._refresh_node_in_tree(n)
             self.action_progress.set((idx / total) * 100)
             self.root.update_idletasks()
-        self._hide_progress_modal()
+        if total > 10:
+            self._hide_progress_modal()
         self._on_select()
         self._update_conflict_banner(self.selected_user.get())
 
@@ -665,18 +686,37 @@ class DataManagerApp:
         win.title("Updating")
         win.geometry("300x120")
         win.transient(self.root)
-        win.grab_set()
         self.progress_window = win
         self.action_progress_label.set(message)
         ttk.Label(win, textvariable=self.action_progress_label).pack(pady=10)
         bar = ttk.Progressbar(win, variable=self.action_progress, length=240, mode="determinate")
         bar.pack(pady=5)
+        # Ensure window is viewable before grabbing focus
+        win.update_idletasks()
+        try:
+            win.wait_visibility()
+            win.grab_set()
+        except tk.TclError:
+            # If the window isn't viewable yet, skip grab to avoid crash
+            pass
 
     def _hide_progress_modal(self) -> None:
         if self.progress_window and tk.Toplevel.winfo_exists(self.progress_window):
             self.progress_window.grab_release()
             self.progress_window.destroy()
         self.progress_window = None
+
+    def _log_action(self, message: str) -> None:
+        username = getpass.getuser()
+        log_path = Path(f"/data/common/configs/data_manager/data_gui_{username}.txt")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{timestamp}] {message}"
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError:
+            pass
 
     def _prompt_conflict_choice(self, animal_id: str, exp_id: str, actor: str) -> tuple:
         """
@@ -1310,9 +1350,11 @@ class DataManagerApp:
                             str(tif_path), "raw", animal, exp, marked_by=actor, status="pending"
                         )
                     tree.item(key, tags=("marked_tag",))
+                    self._log_action(f"MARK_TIFS raw {animal}/{exp}")
                 else:
                     self.datastore.clear_file_deletions_for_exp("raw", animal, exp)
                     tree.item(key, tags=tuple(t for t in tree.item(key, "tags") if t != "marked_tag"))
+                    self._log_action(f"UNMARK_TIFS raw {animal}/{exp}")
 
         def mark_selected():
             sel = tree.selection()
