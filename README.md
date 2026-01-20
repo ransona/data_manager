@@ -19,6 +19,17 @@ python main.py
   - Apply or clear an **owner override** (writes to `ownership_overrides`).
 - Overrides/marks are stored immediately in the shared DB. Metrics are cached in the DB as they’re scanned.
 
+## Admin usage
+
+Run delete_runner to selete stuff requested for delete:
+sudo /home/adamranson/miniconda3/envs/sci/bin/python /home/adamranson/code/data_manager/delete_runner.py
+It will clear the NAS first with nas_clear.py to ensure everyhting on server is removed form NAS (ensures it doesn't get resynced).
+Remember:
+- DEFAULT_MIN_AGE_DAYS means that recently selected files don;t get deleted
+- DEFAULT_INCLUDE_DELETED allows redeletion of all deleted files ever (*DANGER*)
+- LOG_PATH = Path("/data/common/configs/data_manager/delete_runner_log.txt")
+- USERS also get logs of their actions
+
 ## Notes
 - Ownership is guessed from initials appearing in the animal ID (longest match wins). Overrides take precedence.
 - Last access uses file `atime`; if the filesystem doesn’t update atime, values may stay blank.
