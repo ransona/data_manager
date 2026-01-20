@@ -581,6 +581,12 @@ class DataManagerApp:
                     n.scope, n.animal_id, n.exp_id, marked_by=actor
                 )
                 self.datastore.set_kill_status(n.scope, n.animal_id, n.exp_id, status)
+                if n.scope == "processed":
+                    # If user also owns processed, clear their block on raw
+                    self.datastore.resolve_block("raw", n.animal_id, n.exp_id, actor)
+                    remaining = self.datastore.load_blocks().get(("raw", n.animal_id, n.exp_id), [])
+                    if not remaining:
+                        self.datastore.set_kill_status("raw", n.animal_id, n.exp_id, "pending")
                 for user in blockers:
                     self.datastore.upsert_block(
                         n.scope,
@@ -1219,6 +1225,10 @@ class DataManagerApp:
             is_blocking=True,
             other_label="Requested by",
         )
+        self.conflict_blocking_tree.bind(
+            "<Button-3>",
+            lambda e: (self.conflict_blocking_tree.selection_set(self.conflict_blocking_tree.identify_row(e.y)), self._toggle_conflict_blocks()),
+        )
         self.conflict_blocked_tree = build_list(
             right,
             "Your deletions are blocked by others",
@@ -1254,6 +1264,62 @@ class DataManagerApp:
         if len(current) >= 5:
             current[-1] = "kept"
         tree.item(sel, values=current, tags=("resolved",))
+        self._update_conflict_banner(actor)
+
+    def _toggle_conflict_blocks(self) -> None:
+        tree = getattr(self, "conflict_blocking_tree", None)
+        if not tree:
+            return
+        sel = tree.selection()
+        if not sel:
+            return
+        actor = self._acting_user()
+        # Determine current blocking state from DB
+        blocks = self.datastore.load_blocks()
+        pending_count = 0
+        targets = []
+        for iid in sel:
+            try:
+                scope, animal_id, exp_id = iid.split("|")
+            except ValueError:
+                continue
+            targets.append((scope, animal_id, exp_id, iid))
+            blk_rows = blocks.get((scope, animal_id, exp_id), [])
+            if any(r["blocking_user"] == actor and r["status"] == "pending" for r in blk_rows):
+                pending_count += 1
+        if not targets:
+            return
+        # Apply 50% rule: if >=50% pending, unallow (remove block), else re-block
+        if pending_count / len(targets) >= 0.5:
+            # allow deletion (remove block)
+            for scope, animal_id, exp_id, iid in targets:
+                self.datastore.resolve_block(scope, animal_id, exp_id, actor)
+                remaining = self.datastore.load_blocks().get((scope, animal_id, exp_id), [])
+                if not remaining:
+                    self.datastore.set_kill_status(scope, animal_id, exp_id, "pending")
+                # update UI row
+                values = list(tree.item(iid, "values"))
+                if len(values) >= 5:
+                    values[-1] = "approved"
+                tree.item(iid, values=values, tags=("resolved",))
+        else:
+            # re-block (unallow)
+            for scope, animal_id, exp_id, iid in targets:
+                values = list(tree.item(iid, "values"))
+                requested_by = values[2] if len(values) >= 3 else None
+                self.datastore.upsert_block(
+                    scope,
+                    animal_id,
+                    exp_id,
+                    blocking_user=actor,
+                    requested_by=requested_by,
+                    status="pending",
+                )
+                self.datastore.set_kill_status(scope, animal_id, exp_id, "blocked")
+                values = list(tree.item(iid, "values"))
+                if len(values) >= 5:
+                    values[-1] = "blocking"
+                tree.item(iid, values=values, tags=())
         self._update_conflict_banner(actor)
 
     def _conflict_allow(self, tree: ttk.Treeview) -> None:

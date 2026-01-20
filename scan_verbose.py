@@ -15,16 +15,16 @@ from threading import Event, Thread
 
 from data_manager.config import DataPaths, load_user_map
 from data_manager.database import DataStore
-from data_manager.scanner import list_available_users, scan_scope, update_metrics_for_nodes
+from data_manager.scanner import list_available_users, scan_scope, calculate_metrics_for_path
 
 
 def log_nodes(nodes, label: str) -> None:
-    print(f"[{label}] {len(nodes)} nodes")
+    print(f"[{label}] {len(nodes)} nodes", flush=True)
     for n in nodes:
         name = f"{n.animal_id}/{n.exp_id}" if n.exp_id else n.animal_id
         owner = n.owner or n.user or "unknown"
-    print(f"  - {label} {owner}: {name} ({n.path})")
-    print()
+        print(f"  - {label} {owner}: {name} ({n.path})", flush=True)
+    print("", flush=True)
 
 
 def main() -> None:
@@ -50,7 +50,21 @@ def main() -> None:
         log_nodes(proc_nodes, "processed")
 
         print("Computing metrics (this may take a while)...")
-        update_metrics_for_nodes(datastore, raw_nodes + proc_nodes)
+        all_nodes = raw_nodes + proc_nodes
+        total = len(all_nodes)
+        for idx, node in enumerate(all_nodes, start=1):
+            size_bytes, last_access = 0, None
+            if node.path.exists():
+                size_bytes, last_access = calculate_metrics_for_path(node.path)
+                datastore.upsert_metrics(
+                    node.scope, node.animal_id, node.exp_id, size_bytes, last_access
+                )
+            node.size_bytes = size_bytes
+            node.last_access_ts = last_access
+            percent = (idx / total) * 100 if total else 100
+            sys.stdout.write(f"\rMetrics: {idx}/{total} ({percent:.1f}%)")
+            sys.stdout.flush()
+        print()
         duration = time.time() - start
         raw_total = sum(n.size_bytes or 0 for n in raw_nodes)
         proc_total = sum(n.size_bytes or 0 for n in proc_nodes)
