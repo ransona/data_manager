@@ -232,11 +232,19 @@ def main() -> None:
             sys.exit(0)
 
     # Delete folders
+    raw_animals = set()
+    processed_animals = set()
     for scope, animal, exp, p, _sz in folder_sizes:
         if scope == "raw":
+            raw_animals.add(animal)
             nas_path = map_raw_to_nas(p, paths.raw_root)
             if nas_path.exists():
                 safe_delete_nas(nas_path)
+        elif scope == "processed":
+            # track (user, animal) for empty cleanup
+            user = (Path(p).parts[2] if len(Path(p).parts) > 2 else None)
+            if user:
+                processed_animals.add((user, animal))
         if delete_path(p):
             datastore.set_kill_status(scope, animal, exp, status="deleted")
     # Delete files
@@ -247,6 +255,30 @@ def main() -> None:
                 safe_delete_nas(nas_path)
         if delete_path(p):
             datastore.clear_file_deletion(str(p))
+
+    # Cleanup empty raw animal folders
+    for animal in sorted(raw_animals):
+        animal_path = paths.raw_root / animal
+        try:
+            if animal_path.exists() and animal_path.is_dir() and not any(animal_path.iterdir()):
+                delete_path(animal_path)
+                log(f"Removed empty animal folder: {animal_path}")
+        except OSError:
+            log(f"ERROR checking animal folder: {animal_path}")
+
+    # Cleanup empty processed animal folders
+    for user, animal in sorted(processed_animals):
+        candidates = [
+            paths.home_root / user / "Data" / "Repository" / animal,
+            paths.home_root / user / "data" / "Repository" / animal,
+        ]
+        for animal_path in candidates:
+            try:
+                if animal_path.exists() and animal_path.is_dir() and not any(animal_path.iterdir()):
+                    delete_path(animal_path)
+                    log(f"Removed empty processed animal folder: {animal_path}")
+            except OSError:
+                log(f"ERROR checking processed animal folder: {animal_path}")
 
     log("Deletion complete.")
 

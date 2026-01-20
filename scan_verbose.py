@@ -9,6 +9,7 @@ unless interrupted.
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from datetime import datetime, timedelta
 from threading import Event, Thread
